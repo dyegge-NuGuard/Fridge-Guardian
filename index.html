@@ -1,13 +1,16 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Fridge Guardian Dashboard</title>
+
+  <!-- ESP32 API Base URL -->
   <script>
-    // ESP32 IP address for API requests
     const ESP32_BASE = "http://192.168.1.176";
   </script>
+
+  <!-- Local copies loaded via SPIFFS or externally hosted -->
   <script src="/www/lib/react.min.js"></script>
   <script src="/www/lib/react-dom.min.js"></script>
   <script src="/www/lib/babel.min.js"></script>
@@ -15,41 +18,231 @@
 </head>
 <body class="bg-gradient-to-br from-gray-900 to-gray-800 text-white min-h-screen">
   <div id="root"></div>
+
   <script type="text/babel">
     const { useState, useEffect } = React;
 
     function App() {
+      const [currentScreen, setCurrentScreen] = useState('dashboard');
       const [data, setData] = useState({ tempF: null, voltage_mV: null, doorOpen: false, alarm: false });
+      const [dataPoints, setDataPoints] = useState([]);
+      const [history, setHistory] = useState([]);
+      const [filter, setFilter] = useState('all');
+      const [avgDays, setAvgDays] = useState(3);
+      const [dailyStats, setDailyStats] = useState([]);
+      const maxPoints = 100;
 
+      // Fetch status every 1s
       useEffect(() => {
         const fetchStatus = async () => {
           try {
             const res = await fetch(`${ESP32_BASE}/status`);
             const json = await res.json();
             setData(json);
+            setDataPoints(prev => {
+              const pts = [...prev, json.tempF];
+              return pts.length > maxPoints ? pts.slice(pts.length - maxPoints) : pts;
+            });
           } catch (err) {
-            console.error("Failed to fetch status:", err);
+            console.error('status fetch error', err);
           }
         };
         fetchStatus();
-        const interval = setInterval(fetchStatus, 2000);
-        return () => clearInterval(interval);
+        const id = setInterval(fetchStatus, 1000);
+        return () => clearInterval(id);
       }, []);
 
+      // Fetch history every 30s
+      useEffect(() => {
+        const fetchHistory = async () => {
+          try {
+            const res = await fetch(`${ESP32_BASE}/history`);
+            const text = await res.text();
+            const rows = text.trim().split('\n').map(line => {
+              const [ts, t, v, d, a] = line.split(',');
+              return { timestamp: parseInt(ts), tempF: parseFloat(t), voltage_mV: parseFloat(v), door: d, alarm: a };
+            });
+            setHistory(rows);
+          } catch (err) {
+            console.error('history fetch error', err);
+          }
+        };
+        fetchHistory();
+        const id = setInterval(fetchHistory, 30000);
+        return () => clearInterval(id);
+      }, []);
+
+      // Compute daily stats when history or avgDays changes
+      useEffect(() => {
+        const grouped = {};
+        const now = Date.now();
+        history.forEach(row => {
+          if (avgDays > 0 && now - row.timestamp > avgDays * 86400000) return;
+          const day = new Date(row.timestamp).toISOString().split('T')[0];
+          (grouped[day] = grouped[day] || []).push(row.tempF);
+        });
+        const stats = Object.entries(grouped).map(([date, temps]) => {
+          const sum = temps.reduce((a,b) => a+b,0);
+          return { date, avg: sum/temps.length, min: Math.min(...temps), max: Math.max(...temps) };
+        }).sort((a,b) => new Date(b.date) - new Date(a.date));
+        setDailyStats(stats);
+      }, [history, avgDays]);
+
+      // Draw graph
+      useEffect(() => {
+        const canvas = document.getElementById('tempGraph');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        canvas.width = canvas.offsetWidth;
+        canvas.height = 200;
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+
+        // Grid
+        ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+        ctx.lineWidth = 1;
+        for(let y=0; y<=100; y+=20){
+          const yy = canvas.height - (y/100)*canvas.height;
+          ctx.beginPath(); ctx.moveTo(0,yy); ctx.lineTo(canvas.width,yy); ctx.stroke();
+          ctx.fillStyle = 'rgba(255,255,255,0.5)';
+          ctx.fillText(`${y}°F`,5,yy-5);
+        }
+        // Line
+        if(dataPoints.length){
+          ctx.beginPath();
+          dataPoints.forEach((v,i)=>{
+            const x = i*(canvas.width/maxPoints);
+            const y = canvas.height - (v/100)*canvas.height;
+            i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+          });
+          ctx.strokeStyle = '#3b82f6'; ctx.lineWidth=2; ctx.stroke();
+        }
+      }, [dataPoints]);
+
+      const resetGraph = () => setDataPoints([]);
+      const downloadHistory = () => {
+        const header = 'Timestamp,Temp (°F),Voltage,Door,Alarm\n';
+        const csv = history.map(r=>{
+          const d = new Date(r.timestamp).toISOString();
+          return `${d},${r.tempF.toFixed(1)},${r.voltage_mV.toFixed(1)},${r.door},${r.alarm}`;
+        }).join('\n');
+        const blob = new Blob([header+csv], {type:'text/csv'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href=url; a.download='history.csv'; a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      const filteredHistory = history.filter(r => {
+        if(filter==='all') return true;
+        const hours = filter==='hour'?1: filter==='6hours'?6:24;
+        return Date.now() - r.timestamp <= hours*3600000;
+      });
+
       return (
-        <div className="flex flex-col items-center justify-center h-screen text-center">
-          <h1 className="text-3xl font-bold mb-6">Fridge Guardian Dashboard</h1>
-          <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
-            <p className="text-xl">Temperature: <span className="font-bold text-blue-400">{data.tempF ? `${data.tempF.toFixed(1)} °F` : '...'}</span></p>
-            <p className="mt-2">Voltage: {data.voltage_mV ? `${data.voltage_mV.toFixed(1)} mV` : '...'}</p>
-            <p className="mt-2">Door: <span className={`font-semibold ${data.doorOpen ? 'text-red-400' : 'text-green-400'}`}>{data.doorOpen ? 'OPEN' : 'CLOSED'}</span></p>
-            <p className="mt-2">Alarm: <span className={`font-semibold ${data.alarm ? 'text-red-400' : 'text-green-400'}`}>{data.alarm ? 'ON' : 'OFF'}</span></p>
+        <div className="min-h-screen">
+          <nav className="bg-gray-800 p-4 shadow-lg">
+            <div className="container mx-auto flex space-x-4">
+              {['dashboard','history','settings'].map(s => (
+                <button key={s}
+                  onClick={()=>setCurrentScreen(s)}
+                  className={`px-3 py-2 rounded ${currentScreen===s?'bg-blue-600':'bg-gray-700'} hover:bg-blue-500`}>
+                  {s.charAt(0).toUpperCase()+s.slice(1)}
+                </button>
+              ))}
+            </div>
+          </nav>
+          <div className="container mx-auto p-6">
+            {currentScreen==='dashboard' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="bg-gray-800 p-6 rounded-lg shadow">
+                  <h2 className="text-xl font-semibold mb-2">Temperature</h2>
+                  <p className="text-4xl font-bold text-blue-400">{data.tempF?`${data.tempF.toFixed(1)} °F`:'--'}</p>
+                  <p className="text-sm text-gray-400 mt-2">Voltage: {data.voltage_mV?`${data.voltage_mV.toFixed(1)} mV`:'--'}</p>
+                </div>
+                <div className="bg-gray-800 p-6 rounded-lg shadow">
+                  <h2 className="text-xl font-semibold mb-2">Status</h2>
+                  <p className="mt-1">Door: <span className={`font-bold ${data.doorOpen?'text-red-400':'text-green-400'}`}>{data.doorOpen?'OPEN':'CLOSED'}</span></p>
+                  <p className="mt-1">Alarm: <span className={`font-bold ${data.alarm?'text-red-400':'text-green-400'}`}>{data.alarm?'ON':'OFF'}</span></p>
+                </div>
+                <div className="bg-gray-800 p-6 rounded-lg shadow col-span-full">
+                  <h2 className="text-xl font-semibold mb-2">Temperature Trend</h2>
+                  <canvas id="tempGraph" className="w-full h-48"></canvas>
+                  <button className="mt-4 px-4 py-2 bg-blue-600 rounded hover:bg-blue-500" onClick={resetGraph}>Reset Graph</button>
+                </div>
+              </div>
+            )}
+
+            {currentScreen==='history' && (
+              <div className="bg-gray-800 p-6 rounded-lg shadow">
+                <h2 className="text-xl font-semibold mb-4">Historical Data</h2>
+                <div className="flex flex-wrap justify-between mb-4">
+                  <div className="space-x-2">
+                    {[['hour','Last Hour'],['6hours','6 Hours'],['24hours','24 Hours'],['all','All']].map(([val,txt])=>(
+                      <button key={val} onClick={()=>setFilter(val)} className={`px-2 py-1 rounded ${filter===val?'bg-blue-600':'bg-gray-700'} hover:bg-blue-500`}>{txt}</button>
+                    ))}
+                  </div>
+                  <button className="px-3 py-1 bg-green-600 rounded hover:bg-green-500" onClick={downloadHistory}>Download CSV</button>
+                </div>
+
+                <div className="overflow-x-auto mb-6">
+                  <table className="w-full text-left text-sm">
+                    <thead className="bg-gray-700"><tr>
+                      <th className="p-2">Timestamp</th><th className="p-2">Temp (°F)</th>
+                      <th className="p-2">Voltage</th><th className="p-2">Door</th><th className="p-2">Alarm</th>
+                    </tr></thead>
+                    <tbody>
+                      {filteredHistory.map((r,i)=>(
+                        <tr key={i} className="border-b border-gray-700">
+                          <td className="p-2">{new Date(r.timestamp).toLocaleString()}</td>
+                          <td className="p-2">{r.tempF.toFixed(1)}</td>
+                          <td className="p-2">{r.voltage_mV.toFixed(1)}</td>
+                          <td className="p-2">{r.door}</td>
+                          <td className="p-2">{r.alarm}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div>
+                  <h3 className="text-lg font-semibold mb-2">Daily Temperature Stats</h3>
+                  <label className="text-sm text-gray-400 mr-2">Show Last</label>
+                  <select className="bg-gray-700 text-white p-1 rounded mb-2" value={avgDays} onChange={e=>setAvgDays(parseInt(e.target.value))}>
+                    <option value={3}>3 Days</option><option value={7}>7 Days</option>
+                    <option value={14}>14 Days</option><option value={0}>All</option>
+                  </select>
+                  <table className="w-full text-left text-sm">
+                    <thead className="bg-gray-700"><tr>
+                      <th className="p-2">Date</th><th className="p-2">Avg (°F)</th>
+                      <th className="p-2">Min (°F)</th><th className="p-2">Max (°F)</th>
+                    </tr></thead>
+                    <tbody>
+                      {dailyStats.map(row=>(
+                        <tr key={row.date} className="border-b border-gray-700">
+                          <td className="p-2">{row.date}</td>
+                          <td className="p-2">{row.avg.toFixed(1)}</td>
+                          <td className="p-2">{row.min.toFixed(1)}</td>
+                          <td className="p-2">{row.max.toFixed(1)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {currentScreen==='settings' && (
+              <div className="bg-gray-800 p-6 rounded-lg shadow">
+                <h2 className="text-xl font-semibold mb-4">Settings</h2>
+                <p>Settings page placeholder</p>
+              </div>
+            )}
           </div>
         </div>
       );
     }
 
-    ReactDOM.render(<App />, document.getElementById("root"));
+    ReactDOM.render(<App />, document.getElementById('root'));
   </script>
 </body>
 </html>
